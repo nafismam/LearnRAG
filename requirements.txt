@@ -1,0 +1,6 @@
+numpy
+torch
+transformers>=4.45,<5
+accelerate
+sentence-transformers
+requests
