@@ -108,3 +108,7 @@ Seven component tests passed in the preparation environment. Full model executio
 This is an educational, generic document pipeline, not a legal-advice application. It uses character windows, not complete statutory sections. Search always returns top-k passages without a relevance gate, even when the documents cannot answer a question. The prompt requests abstention and citations, but neither is automatically enforced or verified. Inputs are not yet checked against tokenizer or context-window limits, and document instructions can interfere with model behavior.
 
 Useful next steps are token-aware chunking, prompt budgeting, irrelevant-query handling, citation validation, and evaluation against a small set of questions with known supporting passages. There are no claimed accuracy or faithfulness scores yet.
+
+## Capture actual answers
+
+Run `python run_examples.py` after model downloads are available. It asks five fixed questions and saves real answers, retrieved passages, scores, model configuration and document hashes to `results/examples.json` and `results/examples.md`. The unsupported question checks whether the model stays within the documents, even when it may know an answer from training. These are observations, not automatically graded accuracy results. No answer files are included until the real-model run succeeds.
