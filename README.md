@@ -103,7 +103,9 @@ There are seven test cases, including three invalid-configuration cases. Tests u
 
 ## Validation status and limits
 
-Seven component tests passed in the preparation environment. Full model execution remains **unverified** because Hugging Face downloads returned HTTP 403 there. The notebook does not contain fabricated model outputs; run it in your own runtime to observe actual answers.
+Seven component tests passed. The real MiniLM embedding model and Qwen generator also ran successfully on CPU. The notebook contains saved execution outputs, and [five-question results](results/README.md) include actual answers, full retrieved passages, similarity scores and runtime metadata. A separately labeled [Colab transcript](results/colab_observations.md) preserves the owner’s supplied observations.
+
+The CPU examples identified the documented models, explained vector storage, handled a multi-part question and abstained on an unsupported question. None included the requested numbered inline citations. These small demonstrations are not an accuracy benchmark: there are only three chunks and top-k retrieval returns all of them.
 
 This is an educational, generic document pipeline, not a legal-advice application. It uses character windows, not complete statutory sections. Search always returns top-k passages without a relevance gate, even when the documents cannot answer a question. The prompt requests abstention and citations, but neither is automatically enforced or verified. Inputs are not yet checked against tokenizer or context-window limits, and document instructions can interfere with model behavior.
 
@@ -111,4 +113,4 @@ Useful next steps are token-aware chunking, prompt budgeting, irrelevant-query h
 
 ## Capture actual answers
 
-Run `python run_examples.py` after model downloads are available. It asks five fixed questions and saves real answers, retrieved passages, scores, model configuration and document hashes to `results/examples.json` and `results/examples.md`. The unsupported question checks whether the model stays within the documents, even when it may know an answer from training. These are observations, not automatically graded accuracy results. No answer files are included until the real-model run succeeds.
+Run `python run_examples.py` after model downloads are available. It asks five fixed questions and saves real answers, retrieved passages, scores, model configuration and document hashes to `results/examples.json` and `results/examples.md`. The unsupported question checks whether the model stays within the documents, even when it may know an answer from training. These are observations, not automatically graded accuracy results. The committed result files come from a completed real-model run; rerunning replaces them with new observations.
