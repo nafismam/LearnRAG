@@ -108,7 +108,7 @@ class RAGConfig:
 
     # Generation settings.
     max_new_tokens: int = 256
-    temperature: float = 0.0   # low = factual / deterministic, high = creative
+    temperature: float = 0.0   # zero disables sampling; does not guarantee accuracy
 
 
 # ==============================================================================
@@ -127,6 +127,7 @@ class Document:
 def load_documents(data_dir: str) -> list[Document]:
     docs: list[Document] = []
     for path in sorted(Path(data_dir).rglob("*")):
+        # Keep relative paths, so folder_a/note.md and folder_b/note.md stay distinguishable.
         if path.suffix.lower() in {".txt", ".md"} and path.is_file():
             text = path.read_text(encoding="utf-8", errors="ignore").strip()
             if text:
@@ -161,8 +162,10 @@ def _sliding_window(text: str, size: int, overlap: int) -> list[str]:
     if size <= 0 or not 0 <= overlap < size:
         raise ValueError("Require chunk_size > 0 and 0 <= chunk_overlap < chunk_size")
     windows = []
+    # Advance by size-overlap: the tail is repeated, but no window exceeds size.
     for start in range(0, len(text), size - overlap):
         windows.append(text[start:start + size])
+        # Stop after the window covering the final character; avoid an unnecessary tail chunk.
         if start + size >= len(text):
             break
     return windows
@@ -170,11 +173,13 @@ def _sliding_window(text: str, size: int, overlap: int) -> list[str]:
 
 def chunk_documents(docs: list[Document], chunk_size: int, chunk_overlap: int) -> list[Chunk]:
     """Bounded overlapping character windows; preserve each document's source."""
+    # Validate settings even if no documents were supplied.
     _sliding_window("", chunk_size, chunk_overlap)  # validate even for empty input
     chunks = []
     for doc in docs:
         for text in _sliding_window(doc.text, chunk_size, chunk_overlap):
             if text.strip():
+                # len(chunks) supplies a unique sequential ID across ALL documents.
                 chunks.append(Chunk(text, doc.source, len(chunks)))
     print(f"[chunk] {len(chunks)} chunk(s) created")
     return chunks
@@ -193,6 +198,7 @@ def chunk_documents(docs: list[Document], chunk_size: int, chunk_overlap: int) -
 
 class Embedder:
     def __init__(self, model_name: str):
+        # Lazy import keeps pure chunking/tests usable without downloading or loading a model.
         from sentence_transformers import SentenceTransformer
         print(f"[embed] loading embedding model '{model_name}' ...")
         self.model = SentenceTransformer(model_name)
@@ -205,6 +211,7 @@ class Embedder:
             normalize_embeddings=True,   # unit vectors -> dot product == cosine sim
             show_progress_bar=len(texts) > 50,
         )
+        # Consistent numeric storage; normalization above makes dot products cosine similarities.
         return vectors.astype(np.float32)
 
 
@@ -219,8 +226,8 @@ class Embedder:
 #   2. similarity = matrix @ q      -> one score per chunk, in [-1, 1]
 #   3. take the top_k highest scores
 #
-# This is exact (brute-force) search. FAISS / Chroma / Qdrant do the same thing
-# with approximate indexes that scale to millions of vectors.
+# This is exact (brute-force) search. Larger systems may use approximate indexes
+# in libraries/services such as FAISS, Chroma or Qdrant; supported index types vary.
 
 class VectorStore:
     def __init__(self, embedder: Embedder):
@@ -231,25 +238,30 @@ class VectorStore:
     def add(self, chunks: list[Chunk]) -> None:
         if not chunks: raise ValueError("Cannot index empty chunks")
         self.chunks = chunks
+        # Matrix row i must stay aligned with self.chunks[i] for trustworthy source labels.
         self.matrix = self.embedder.encode([c.text for c in chunks])
         print(f"[index] vector matrix shape: {self.matrix.shape}")
 
     def search(self, query: str, top_k: int) -> list[tuple[Chunk, float]]:
         assert self.matrix is not None, "Call add() before search()."
         if top_k <= 0 or not query.strip(): raise ValueError("Require a nonempty query and positive top_k")
+        # Reuse the document embedder: query and document vectors must share a representation.
         q = self.embedder.encode([query])[0]
         scores = self.matrix @ q                      # cosine similarities
         top_k = min(top_k, len(self.chunks))
+        # Negation turns ascending argsort into descending rank. No relevance gate is applied.
         best = np.argsort(-scores)[:top_k]            # indices, highest first
         return [(self.chunks[i], float(scores[i])) for i in best]
 
     # Optional persistence so you don't re-embed on every run.
     def save(self, path: str) -> None:
+        # Store text as string arrays so loading needs no pickle object deserialization.
         np.savez(path, matrix=self.matrix,
                  texts=np.array([c.text for c in self.chunks], dtype=str),
                  sources=np.array([c.source for c in self.chunks], dtype=str))
 
     def load(self, path: str) -> None:
+        # Caller must use the matching embedding model; this file has no model-compatibility manifest.
         data = np.load(path, allow_pickle=False)
         self.matrix = data["matrix"]
         self.chunks = [Chunk(t, s, i) for i, (t, s) in enumerate(zip(data["texts"], data["sources"]))]
@@ -273,6 +285,7 @@ SYSTEM_PROMPT = (
 
 
 def build_messages(question: str, retrieved: list[tuple[Chunk, float]]) -> list[dict]:
+    # Number evidence in retrieved order. Prompt labels do not guarantee valid generated citations.
     context = "\n\n".join(
         f"[{i}] (source: {chunk.source})\n{chunk.text}"
         for i, (chunk, _score) in enumerate(retrieved, start=1)
@@ -314,6 +327,7 @@ class HuggingFaceLLM:
             torch_dtype="auto",
             device_map="auto",
         )
+        # Evaluation mode disables training-only behavior such as dropout; it does not prove accuracy.
         self.model.eval()
 
     def generate(self, messages: list[dict], max_new_tokens: int, temperature: float) -> str:
@@ -324,6 +338,8 @@ class HuggingFaceLLM:
         # 2. string -> token ids
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
         # 3. autoregressive generation
+        # Inference does not need gradients, saving work and memory.
+        # Temperature zero disables sampling, not hallucinations or all cross-device variation.
         with self.torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
@@ -334,6 +350,7 @@ class HuggingFaceLLM:
                 pad_token_id=self.tokenizer.eos_token_id,
             )
         # 4. drop the prompt tokens, decode only the newly generated part
+        # Decoder-only output includes input tokens; slice them away to avoid echoing the prompt.
         new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
@@ -361,6 +378,7 @@ class OllamaLLM:
             },
             timeout=300,
         )
+        # Do not silently treat an HTTP failure as an answer.
         resp.raise_for_status()
         return resp.json()["message"]["content"].strip()
 
@@ -373,6 +391,7 @@ class SimpleRAG:
     def __init__(self, config: RAGConfig, backend: str = "hf"):
         self.config = config
 
+        # Build once per instance; ask() then embeds only each new question.
         # ---- Indexing phase -------------------------------------------------
         docs = load_documents(config.data_dir)
         chunks = chunk_documents(docs, config.chunk_size, config.chunk_overlap)
@@ -383,6 +402,7 @@ class SimpleRAG:
         self.llm = OllamaLLM(config.llm_model) if backend == "ollama" else HuggingFaceLLM(config.llm_model)
 
     def ask(self, question: str, verbose: bool = True) -> dict:
+        # The three steps below are the RAG flow; source records remain available for inspection.
         # RETRIEVE
         retrieved = self.store.search(question, self.config.top_k)
         # AUGMENT
@@ -402,6 +422,7 @@ class SimpleRAG:
             print(f"A: {answer}")
             print("=" * 70)
 
+        # Separate evidence from generated prose. Returned sources are not verified claim-to-citation links.
         return {
             "question": question,
             "answer": answer,
