@@ -69,6 +69,8 @@ The first run downloads the models from Hugging Face (cached afterwards).
 ==============================================================================
 """
 
+# Read this file from top to bottom: settings, files, chunks, search, prompt, then answer.
+# The notebook imports these classes instead of keeping a second copy of the pipeline.
 from __future__ import annotations
 
 import argparse
@@ -79,55 +81,51 @@ from pathlib import Path
 import numpy as np
 
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-# All tunable knobs in one place. Changing these is the easiest way to
-# experiment with how retrieval quality and answer quality behave.
-
+# SETTINGS: keep the model names and search settings together so they are easy to change.
+# These defaults are for a small example; they were not chosen by an accuracy study.
 @dataclass
 class RAGConfig:
-    # Folder containing the documents we want to "chat with".
+
+    # Read text and Markdown files from this folder.
     data_dir: str = "data"
 
-    # Embedding model: converts text to vectors. all-MiniLM-L6-v2 is small, fast
-    # and good enough for English. For better quality try "BAAI/bge-small-en-v1.5"
-    # or for multilingual text "intfloat/multilingual-e5-small".
+
+    # This model turns English text into 384 numbers used for matching.
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
-    # Generator LLM: any Hugging Face chat/instruct model works.
+
+    # This is a different model: it writes the answer from the retrieved text.
     llm_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
 
-    # Chunking: documents are split into pieces of ~chunk_size characters, with
-    # chunk_overlap characters shared between neighbours to retain some boundary context. This does not guarantee whole sentences.
+
+    # Cut at most 500 characters at a time. Repeat 100 characters across each boundary.
+    # This helps keep some context, but can still cut sentences in half.
     chunk_size: int = 500
     chunk_overlap: int = 100
 
-    # How many chunks to retrieve and put into the prompt.
+
+    # Return this many passages, even if their scores are low. No relevance gate here.
     top_k: int = 3
 
-    # Generation settings.
+
     max_new_tokens: int = 256
-    temperature: float = 0.0   # zero disables sampling; does not guarantee accuracy
+    # Zero turns off sampling. It does not make every answer true or fully repeatable everywhere.
+    temperature: float = 0.0
 
 
-# ==============================================================================
-# STEP 1 - LOAD DOCUMENTS
-# ==============================================================================
-# We read every .txt / .md file in the data folder. Each document keeps its
-# file name as "source" so we can cite where an answer came from.
-# (To support PDFs, read them with `pypdf` and return the extracted text here.)
-
+# 1. LOAD: keep the document text together with the path it came from.
 @dataclass
 class Document:
     text: str
     source: str
 
 
+# Read files in a consistent order. Skip empty files and stop if no usable files exist.
 def load_documents(data_dir: str) -> list[Document]:
     docs: list[Document] = []
     for path in sorted(Path(data_dir).rglob("*")):
-        # Keep relative paths, so folder_a/note.md and folder_b/note.md stay distinguishable.
+
+        # Keep the folder in the source name: two folders can both contain a file called note.md.
         if path.suffix.lower() in {".txt", ".md"} and path.is_file():
             text = path.read_text(encoding="utf-8", errors="ignore").strip()
             if text:
@@ -138,19 +136,7 @@ def load_documents(data_dir: str) -> list[Document]:
     return docs
 
 
-# ==============================================================================
-# STEP 2 - CHUNKING
-# ==============================================================================
-# WHY CHUNK?
-#   * Embedding models have an input limit (all-MiniLM-L6-v2: 256 tokens).
-#   * A whole document as one vector is a "blurry average" of many topics; small
-#     chunks give sharp, topic-specific vectors and therefore better retrieval.
-#   * The LLM's context window is limited, so we only want the relevant bits.
-#
-# STRATEGY (simple but effective):
-#   Use bounded sliding windows of up to chunk_size characters. Consecutive character windows overlap by chunk_overlap.
-#   This generic example does not preserve complete legal sections.
-
+# 2. SPLIT: each piece keeps its source path and a number, so we can inspect it later.
 @dataclass
 class Chunk:
     text: str
@@ -159,13 +145,16 @@ class Chunk:
 
 
 def _sliding_window(text: str, size: int, overlap: int) -> list[str]:
+    # Reject settings that would make empty pieces or prevent us from moving forward.
     if size <= 0 or not 0 <= overlap < size:
         raise ValueError("Require chunk_size > 0 and 0 <= chunk_overlap < chunk_size")
     windows = []
-    # Advance by size-overlap: the tail is repeated, but no window exceeds size.
+
+    # With size=500 and overlap=100, start at 0, 400, 800, and so on.
     for start in range(0, len(text), size - overlap):
         windows.append(text[start:start + size])
-        # Stop after the window covering the final character; avoid an unnecessary tail chunk.
+
+        # We have covered the end of the text; do not add another repeated tail.
         if start + size >= len(text):
             break
     return windows
@@ -173,62 +162,46 @@ def _sliding_window(text: str, size: int, overlap: int) -> list[str]:
 
 def chunk_documents(docs: list[Document], chunk_size: int, chunk_overlap: int) -> list[Chunk]:
     """Bounded overlapping character windows; preserve each document's source."""
-    # Validate settings even if no documents were supplied.
-    _sliding_window("", chunk_size, chunk_overlap)  # validate even for empty input
+
+    # Check the settings even if the document list is empty.
+    _sliding_window("", chunk_size, chunk_overlap)
     chunks = []
     for doc in docs:
         for text in _sliding_window(doc.text, chunk_size, chunk_overlap):
             if text.strip():
-                # len(chunks) supplies a unique sequential ID across ALL documents.
+
+                # Use the current list length as the next ID: 0, 1, 2, ... across all files.
                 chunks.append(Chunk(text, doc.source, len(chunks)))
     print(f"[chunk] {len(chunks)} chunk(s) created")
     return chunks
 
 
-
-# ==============================================================================
-# STEP 3 - EMBEDDINGS
-# ==============================================================================
-# An embedding model maps text -> fixed-length vector (here 384 floats).
-# Sentences with similar MEANING end up close together, even if they share no
-# words ("car" vs "automobile"). We embed every chunk once and store the vectors.
-#
-# We L2-normalise the vectors (length = 1). Then cosine similarity is simply a
-# dot product, which makes search a single matrix multiplication.
-
+# 3. EMBED: turn each chunk into numbers. Similar texts can have similar vectors.
+# Compute document vectors once, rather than repeat that work for every question.
 class Embedder:
     def __init__(self, model_name: str):
-        # Lazy import keeps pure chunking/tests usable without downloading or loading a model.
+
+        # Import here so loading files and testing the chunker do not need this package.
         from sentence_transformers import SentenceTransformer
         print(f"[embed] loading embedding model '{model_name}' ...")
         self.model = SentenceTransformer(model_name)
 
     def encode(self, texts: list[str]) -> np.ndarray:
+        # Give each vector length one. That lets a dot product measure cosine similarity later.
         vectors = self.model.encode(
             texts,
             batch_size=32,
             convert_to_numpy=True,
-            normalize_embeddings=True,   # unit vectors -> dot product == cosine sim
+            normalize_embeddings=True,
             show_progress_bar=len(texts) > 50,
         )
-        # Consistent numeric storage; normalization above makes dot products cosine similarities.
+
+        # Store the numbers in one consistent format.
         return vectors.astype(np.float32)
 
 
-# ==============================================================================
-# STEP 4 - VECTOR STORE + RETRIEVAL
-# ==============================================================================
-# The "vector database" is just a matrix of shape (num_chunks, embedding_dim)
-# plus the list of chunks it was built from.
-#
-# Retrieval:
-#   1. embed the question           -> q            (shape: [dim])
-#   2. similarity = matrix @ q      -> one score per chunk, in [-1, 1]
-#   3. take the top_k highest scores
-#
-# This is exact (brute-force) search. Larger systems may use approximate indexes
-# in libraries/services such as FAISS, Chroma or Qdrant; supported index types vary.
-
+# 4. STORE AND SEARCH: a NumPy table is enough for this tiny collection.
+# Row 0 holds chunk 0's vector, row 1 holds chunk 1's vector, and so on.
 class VectorStore:
     def __init__(self, embedder: Embedder):
         self.embedder = embedder
@@ -238,45 +211,46 @@ class VectorStore:
     def add(self, chunks: list[Chunk]) -> None:
         if not chunks: raise ValueError("Cannot index empty chunks")
         self.chunks = chunks
-        # Matrix row i must stay aligned with self.chunks[i] for trustworthy source labels.
+
+        # Keep vector rows in the same order as the chunks, or source labels would be wrong.
         self.matrix = self.embedder.encode([c.text for c in chunks])
         print(f"[index] vector matrix shape: {self.matrix.shape}")
 
     def search(self, query: str, top_k: int) -> list[tuple[Chunk, float]]:
         assert self.matrix is not None, "Call add() before search()."
         if top_k <= 0 or not query.strip(): raise ValueError("Require a nonempty query and positive top_k")
-        # Reuse the document embedder: query and document vectors must share a representation.
+
+        # Use the same model for questions and documents so their vectors can be compared.
         q = self.embedder.encode([query])[0]
-        scores = self.matrix @ q                      # cosine similarities
+        # @ compares the question with every stored vector in one operation.
+        # Vectors have length one, so these dot products are cosine scores, not probabilities.
+        scores = self.matrix @ q
         top_k = min(top_k, len(self.chunks))
-        # Negation turns ascending argsort into descending rank. No relevance gate is applied.
-        best = np.argsort(-scores)[:top_k]            # indices, highest first
+
+        # argsort gives positions from smallest to largest; minus scores puts the best first.
+        best = np.argsort(-scores)[:top_k]
         return [(self.chunks[i], float(scores[i])) for i in best]
 
-    # Optional persistence so you don't re-embed on every run.
+
+    # Saving avoids computing document vectors again. SimpleRAG does not call save/load for you.
     def save(self, path: str) -> None:
-        # Store text as string arrays so loading needs no pickle object deserialization.
+
+        # Save ordinary strings, not Python objects that need pickle when loaded.
         np.savez(path, matrix=self.matrix,
                  texts=np.array([c.text for c in self.chunks], dtype=str),
                  sources=np.array([c.source for c in self.chunks], dtype=str))
 
     def load(self, path: str) -> None:
-        # Caller must use the matching embedding model; this file has no model-compatibility manifest.
+
+        # Load only files you expect. You must still use the same embedding model as when saving.
+        # This example does not record or verify that model choice in the saved index.
         data = np.load(path, allow_pickle=False)
         self.matrix = data["matrix"]
         self.chunks = [Chunk(t, s, i) for i, (t, s) in enumerate(zip(data["texts"], data["sources"]))]
 
 
-# ==============================================================================
-# STEP 5 - PROMPT CONSTRUCTION (the "Augmented" in RAG)
-# ==============================================================================
-# We give the LLM:
-#   * a system instruction: answer ONLY from the context, admit when unsure
-#   * the retrieved chunks, numbered and labelled with their source
-#   * the user's question
-#
-# Context-only instructions encourage grounding but do not guarantee faithful answers.
-
+# 5. PROMPT: ask the writer to use the passages, cite them, and admit missing information.
+# These are instructions, not guarantees. Our saved answers omitted the requested inline citations.
 SYSTEM_PROMPT = (
     "You are a helpful assistant that answers questions using ONLY the provided context. "
     "If the answer is not contained in the context, say \"I don't know based on the "
@@ -285,35 +259,23 @@ SYSTEM_PROMPT = (
 
 
 def build_messages(question: str, retrieved: list[tuple[Chunk, float]]) -> list[dict]:
-    # Number evidence in retrieved order. Prompt labels do not guarantee valid generated citations.
+
+    # Label each passage [1], [2], etc. and show its source beside the text.
     context = "\n\n".join(
         f"[{i}] (source: {chunk.source})\n{chunk.text}"
         for i, (chunk, _score) in enumerate(retrieved, start=1)
     )
     user_prompt = f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
-    # Chat models expect a list of role/content messages. The tokenizer's chat
-    # template converts this into the exact special-token format the model was
-    # trained on (different for Qwen, Llama, Mistral, ...).
+
+
+    # The system message sets instructions; the user message holds evidence and the question.
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
 
 
-# ==============================================================================
-# STEP 6 - THE GENERATOR LLM (the "Generation" in RAG)
-# ==============================================================================
-# We load an open-source instruct model with Hugging Face transformers.
-#   * device_map="auto" puts the model on GPU if available, else CPU.
-#   * torch_dtype="auto" uses the dtype the model was saved in (bf16/fp16 on GPU).
-#
-# Want even less memory? Install `bitsandbytes` and load in 4-bit:
-#     from transformers import BitsAndBytesConfig
-#     quant = BitsAndBytesConfig(load_in_4bit=True)
-#     AutoModelForCausalLM.from_pretrained(name, quantization_config=quant, ...)
-#
-# Prefer Ollama? See the `OllamaLLM` class below - same interface.
-
+# 6. GENERATE: load Qwen locally. The first run downloads its files.
 class HuggingFaceLLM:
     def __init__(self, model_name: str):
         import torch
@@ -321,25 +283,31 @@ class HuggingFaceLLM:
 
         print(f"[llm] loading LLM '{model_name}' (first run downloads it) ...")
         self.torch = torch
+        # The tokenizer converts between readable text and the token IDs the model uses.
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # Let the library choose the saved number format and suitable devices.
+        # A larger model may need more memory than the machine has available.
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype="auto",
             device_map="auto",
         )
-        # Evaluation mode disables training-only behavior such as dropout; it does not prove accuracy.
+
+        # Turn off training-only behavior such as dropout. We are answering, not training.
         self.model.eval()
 
     def generate(self, messages: list[dict], max_new_tokens: int, temperature: float) -> str:
-        # 1. messages -> single prompt string in the model's chat format
+
+        # Put the messages into the chat format this particular model expects.
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        # 2. string -> token ids
+
+        # Convert the prompt into tokens and put them on the model's device.
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        # 3. autoregressive generation
-        # Inference does not need gradients, saving work and memory.
-        # Temperature zero disables sampling, not hallucinations or all cross-device variation.
+
+
+        # No training gradients are needed, which saves memory and work.
         with self.torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
@@ -349,12 +317,14 @@ class HuggingFaceLLM:
                 top_p=0.9 if temperature > 0 else None,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
-        # 4. drop the prompt tokens, decode only the newly generated part
-        # Decoder-only output includes input tokens; slice them away to avoid echoing the prompt.
+
+
+        # The output contains the original prompt too. Keep only the newly written answer.
         new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
+# Optional alternative: ask an already-running local Ollama server to generate the answer.
 class OllamaLLM:
     """
     Alternative generator using a local Ollama server (https://ollama.com).
@@ -378,36 +348,37 @@ class OllamaLLM:
             },
             timeout=300,
         )
-        # Do not silently treat an HTTP failure as an answer.
+
+        # Stop on an HTTP error instead of pretending the failed request returned an answer.
         resp.raise_for_status()
         return resp.json()["message"]["content"].strip()
 
 
-# ==============================================================================
-# STEP 7 - PUTTING IT ALL TOGETHER
-# ==============================================================================
-
+# 7. CONNECT THE PARTS: prepare the documents and load the models once for this object.
 class SimpleRAG:
     def __init__(self, config: RAGConfig, backend: str = "hf"):
         self.config = config
 
-        # Build once per instance; ask() then embeds only each new question.
-        # ---- Indexing phase -------------------------------------------------
+
         docs = load_documents(config.data_dir)
         chunks = chunk_documents(docs, config.chunk_size, config.chunk_overlap)
         self.store = VectorStore(Embedder(config.embedding_model))
         self.store.add(chunks)
 
-        # ---- Generator ------------------------------------------------------
+
         self.llm = OllamaLLM(config.llm_model) if backend == "ollama" else HuggingFaceLLM(config.llm_model)
 
+    # Each question follows three steps. No document re-indexing is needed here.
     def ask(self, question: str, verbose: bool = True) -> dict:
-        # The three steps below are the RAG flow; source records remain available for inspection.
-        # RETRIEVE
+
+
+        # Retrieve: find the closest document pieces.
         retrieved = self.store.search(question, self.config.top_k)
-        # AUGMENT
+
+        # Augment: put those pieces into the prompt alongside the question.
         messages = build_messages(question, retrieved)
-        # GENERATE
+
+        # Generate: let the model write an answer using that prompt.
         answer = self.llm.generate(messages, self.config.max_new_tokens, self.config.temperature)
 
         if verbose:
@@ -422,7 +393,9 @@ class SimpleRAG:
             print(f"A: {answer}")
             print("=" * 70)
 
-        # Separate evidence from generated prose. Returned sources are not verified claim-to-citation links.
+
+        # Return evidence separately so a reader can inspect it, even if the answer has no citations.
+        # This does not automatically check that every sentence is supported.
         return {
             "question": question,
             "answer": answer,
@@ -430,10 +403,7 @@ class SimpleRAG:
         }
 
 
-# ==============================================================================
-# COMMAND-LINE ENTRY POINT
-# ==============================================================================
-
+# COMMAND LINE: read settings such as --top_k and --question from the user's command.
 def parse_args() -> argparse.Namespace:
     d = RAGConfig()
     p = argparse.ArgumentParser(description="Simple RAG pipeline with an open-source LLM")
@@ -451,6 +421,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# Build the pipeline, then answer one question or keep asking until the user exits.
 def main() -> None:
     args = parse_args()
     config = RAGConfig(
@@ -481,20 +452,7 @@ def main() -> None:
             rag.ask(q)
 
 
+# Run main() when launched as a script, but not when imported by the notebook or tests.
 if __name__ == "__main__":
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # silence a HF warning
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     main()
-
-
-# ==============================================================================
-# WHERE TO GO NEXT
-# ==============================================================================
-#  * Better chunking   : split by sentences/tokens (e.g. LangChain's
-#                        RecursiveCharacterTextSplitter) or by document structure.
-#  * Better retrieval  : hybrid search (BM25 keyword + vectors), or a re-ranker
-#                        such as "BAAI/bge-reranker-base" on the top-20 results.
-#  * Scale             : replace VectorStore with FAISS, Chroma, Qdrant, pgvector.
-#  * Evaluation        : build a small set of question/answer pairs and measure
-#                        retrieval hit-rate and answer correctness (e.g. RAGAS).
-#  * Frameworks        : LangChain / LlamaIndex / Haystack wrap all of the above,
-#                        but now you know what they do under the hood.

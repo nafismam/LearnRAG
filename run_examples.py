@@ -9,7 +9,8 @@ import time
 
 from simple_rag import RAGConfig, SimpleRAG
 
-# Fixed hand-picked questions make observations comparable, not statistically representative.
+
+# Ask the same five questions so readers can compare runs. This is not a benchmark.
 QUESTIONS = [
     ('answerable', 'Which embedding model does this pipeline use?'),
     ('answerable', 'How are document vectors stored and compared?'),
@@ -22,7 +23,8 @@ QUESTIONS = [
 def main():
     root = Path(__file__).resolve().parent
     config = RAGConfig(data_dir=str(root / 'data'), temperature=0.0)
-    # Load/index once, outside the timed per-question loop. Downloads are not generation timings.
+
+    # Load the models once. Time each question after setup, not the model downloads.
     pipeline = SimpleRAG(config)
     results = []
     for kind, question in QUESTIONS:
@@ -30,7 +32,9 @@ def main():
         result = pipeline.ask(question)
         result.update(kind=kind, elapsed_seconds=round(time.perf_counter() - start, 3))
         results.append(result)
-    # Record configuration, versions and source hashes so readers can inspect what was run.
+
+    # Save the settings, package versions and document fingerprints alongside the answers.
+    # This helps readers see what was used if another run gives different wording.
     report = {
         'executed_at_utc': datetime.now(timezone.utc).isoformat(),
         'config': asdict(config),
@@ -41,7 +45,8 @@ def main():
         'results': results,
         'scope': 'Observed outputs, not automatically graded correctness or verified citations.',
     }
-    # Write results only after all questions finish; never substitute canned answers on failure.
+
+    # Save only after all five questions finish. A failed run must not create made-up answers.
     output = root / 'results'
     output.mkdir(exist_ok=True)
     (output / 'examples.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
