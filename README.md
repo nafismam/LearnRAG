@@ -36,7 +36,7 @@ An **embedding** is a list of numbers representing text. **Cosine similarity** c
 [Open the notebook in Colab](https://colab.research.google.com/github/nafismam/LearnRAG/blob/main/simple_rag.ipynb).
 
 1. Select **Runtime → Change runtime type → T4 GPU**, if available.
-2. Run the cells in order. The setup cell gets the code and sample data; the next cell installs dependencies.
+2. Run the cells in order. The setup cell gets the sample data and dependencies; the main pipeline code is visible directly in the notebook. For a quick interview walkthrough, run setup and then the final saved-results viewer without loading models.
 3. Wait for the model downloads and loading to finish.
 4. Inspect retrieved sources beside each generated answer.
 5. Change a question or edit a document in `data/`. Rebuild the pipeline after editing documents.
@@ -75,7 +75,7 @@ The default models are `sentence-transformers/all-MiniLM-L6-v2` for embeddings a
 ## Files
 
 - `simple_rag.py`: the pipeline, component classes, and command-line interface.
-- `simple_rag.ipynb`: a guided demonstration using the same Python implementation.
+- `simple_rag.ipynb`: the complete pipeline split into explained code cells, followed by live examples and a saved-results viewer.
 - `data/rag_notes.md`: sample content used to answer demonstration questions.
 - `tests/test_simple_rag.py`: checks for core behavior without downloading models.
 - `requirements.txt`: runtime dependencies; `requirements-dev.txt` adds pytest.
@@ -103,7 +103,7 @@ There are seven test cases, including three invalid-configuration cases. Tests u
 
 ## Validation status and limits
 
-Seven component tests passed. The real MiniLM embedding model and Qwen generator also ran successfully on CPU. The notebook contains saved execution outputs, and [five-question results](results/README.md) include actual answers, full retrieved passages, similarity scores and runtime metadata. A separately labeled [Colab transcript](results/colab_observations.md) preserves the owner’s supplied observations.
+Seven component tests passed. The real MiniLM embedding model and Qwen generator also ran successfully on CPU. The notebook includes a viewer for the saved run, and [five-question results](results/README.md) include actual answers, full retrieved passages, similarity scores and runtime metadata. A separately labeled [Colab transcript](results/colab_observations.md) preserves the owner’s supplied observations.
 
 The CPU examples identified the documented models, explained vector storage, handled a multi-part question and abstained on an unsupported question. None included the requested numbered inline citations. These small demonstrations are not an accuracy benchmark: there are only three chunks and top-k retrieval returns all of them.
 
